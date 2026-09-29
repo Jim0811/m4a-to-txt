@@ -1,101 +1,138 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-m4a_to_txt.py
-簡單的命令列工具：把輸入的 m4a 檔案轉成文字 (.txt)。
-使用流程：
-    python m4a_to_txt.py input.m4a output.txt --model small
-"""
+"""將 M4A 音檔轉為 UTF-8 文字檔。"""
 
-import sys
-import os
 import argparse
-from pydub import AudioSegment
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+import torch
 import whisper
 from tqdm import tqdm
-import torch
-device = "cuda" if torch.cuda.is_available() else "cpu"
-model = whisper.load_model("small", device=device)
 
-def ensure_ffmpeg():
-    # 嘗試執行 ffmpeg --version 確認是否可用
-    from shutil import which
-    if which("ffmpeg") is None:
-        raise EnvironmentError("找不到 ffmpeg，請先安裝並把 ffmpeg 加到 PATH。")
 
-def m4a_to_wav(m4a_path, wav_path):
-    """使用 pydub 將 m4a 轉成 wav（16k/16-bit）以提高相容性"""
-    audio = AudioSegment.from_file(m4a_path, format="m4a")
-    # 轉成單聲道、16kHz、16-bit PCM
-    audio = audio.set_frame_rate(16000).set_channels(1).set_sample_width(2)
-    audio.export(wav_path, format="wav")
-    return wav_path
+def check_dependencies() -> None:
+    for command in ("ffmpeg", "ffprobe"):
+        if shutil.which(command) is None:
+            raise RuntimeError(f"找不到 {command}，請安裝 FFmpeg 並加入 PATH。")
 
-def transcribe_with_whisper(wav_path, model_name="small", language=None, verbose=True):
-    """使用 whisper 進行轉錄，回傳完整文字"""
-    if verbose:
-        print(f"載入 Whisper 模型：{model_name}（視模型大小載入時間會較長）...")
-    model = whisper.load_model(model_name)
 
-    # 使用 model.transcribe（會自動做分段）
-    if verbose:
-        print("開始轉錄...")
-    options = {}
+def get_duration(input_path: Path) -> float:
+    result = subprocess.run(
+        [
+            "ffprobe", "-v", "error", "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1", str(input_path),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return float(result.stdout.strip())
+
+
+def parse_ffmpeg_time(value: str) -> float:
+    hours, minutes, seconds = value.split(":")
+    return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+
+
+def convert_to_wav(input_path: Path, wav_path: Path) -> None:
+    duration = get_duration(input_path)
+    command = [
+        "ffmpeg", "-nostdin", "-v", "error", "-i", str(input_path),
+        "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le",
+        "-progress", "pipe:1", "-nostats", "-y", str(wav_path),
+    ]
+    process = subprocess.Popen(
+        command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, encoding="utf-8", errors="replace",
+    )
+    assert process.stdout is not None
+    errors = []
+    with tqdm(total=duration, desc="轉換 WAV", unit="秒", dynamic_ncols=True) as bar:
+        for line in process.stdout:
+            line = line.strip()
+            if line.startswith("out_time="):
+                try:
+                    elapsed = parse_ffmpeg_time(line.partition("=")[2])
+                    bar.update(max(0.0, min(duration, elapsed) - bar.n))
+                except ValueError:
+                    pass
+            elif line and "=" not in line:
+                errors.append(line)
+
+        if process.wait() != 0:
+            raise RuntimeError("FFmpeg 轉換失敗：" + "\n".join(errors[-10:]))
+        bar.update(max(0.0, duration - bar.n))
+
+def add_punctuation(result: dict) -> str:
+    """保留 Whisper 的標點，並在明顯停頓及文末補上句號。"""
+    segments = result.get("segments", [])
+    chinese = result.get("language") == "zh"
+    period = "。" if chinese else "."
+    punctuation = "。！？.!?，,；;：:、…"
+
+    if not segments:
+        text = result.get("text", "").strip()
+        return text if not text or text[-1] in punctuation else text + period
+
+    parts = []
+    for index, segment in enumerate(segments):
+        part = segment["text"]
+        parts.append(part)
+        if index + 1 < len(segments):
+            gap = segments[index + 1]["start"] - segment["end"]
+            if gap >= 1.2 and part.rstrip() and part.rstrip()[-1] not in punctuation:
+                parts[-1] = part.rstrip() + period
+
+    text = "".join(parts).strip()
+    return text if not text or text[-1] in punctuation else text + period
+
+def transcribe(wav_path: Path, model_name: str, language: str | None) -> str:
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"載入 Whisper 模型：{model_name}（{device}）...", flush=True)
+    model = whisper.load_model(model_name, device=device)
+    print("開始轉錄...", flush=True)
+    options = {"verbose": False, "task": "transcribe"}
     if language:
         options["language"] = language
-        options["task"] = "transcribe"
-    # Whisper 的 transcribe 已含語音段落與時間標記，這裡我們只取 text
-    result = model.transcribe(wav_path, **options)
-    text = result.get("text", "").strip()
-    return text, result
+    if language == "zh":
+        options["initial_prompt"] = "這是一段帶有自然標點符號的繁體中文逐字稿。"
+        options["carry_initial_prompt"] = True
+    result = model.transcribe(str(wav_path), **options)
+    return add_punctuation(result)
 
-def main():
-    parser = argparse.ArgumentParser(description="將 m4a 轉為文字（.txt），使用本地 Whisper。")
-    parser.add_argument("input", help="輸入檔案 (m4a)")
-    parser.add_argument("output", help="輸出檔案 (.txt)")
-    parser.add_argument("--model", default="small", help="Whisper 模型大小，e.g. tiny, base, small, medium, large (預設: small)")
-    parser.add_argument("--language", default=None, help="如果知道音檔語言，可指定語言代碼（例如 zh, en），可加速與提高正確率")
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="使用本地 Whisper 將 M4A 轉為文字。")
+    parser.add_argument("input", type=Path, help="輸入 M4A 檔案")
+    parser.add_argument("output", type=Path, help="輸出 TXT 檔案")
+    parser.add_argument("--model", default="small", help="Whisper 模型名稱（預設：small）")
+    parser.add_argument("--language", help="語言代碼，例如 zh、en；省略則自動偵測")
     args = parser.parse_args()
 
-    input_path = args.input
-    output_path = args.output
-    model_name = args.model
-    language = args.language
-
-    if not os.path.isfile(input_path):
-        print(f"錯誤：找不到輸入檔案：{input_path}")
-        sys.exit(1)
-
     try:
-        ensure_ffmpeg()
-    except EnvironmentError as e:
-        print("錯誤：", e)
-        sys.exit(1)
+        if not args.input.is_file():
+            raise FileNotFoundError(f"找不到輸入檔案：{args.input}")
+        if args.input.resolve() == args.output.resolve():
+            raise ValueError("輸入與輸出路徑不能相同。")
+        check_dependencies()
 
-    tmp_wav = os.path.splitext(output_path)[0] + "_tmp.wav"
+        with tempfile.TemporaryDirectory(prefix="m4a_to_txt_") as tmp_dir:
+            wav_path = Path(tmp_dir) / "audio.wav"
+            convert_to_wav(args.input, wav_path)
+            text = transcribe(wav_path, args.model, args.language)
 
-    try:
-        print("轉換 m4a -> wav ...")
-        m4a_to_wav(input_path, tmp_wav)
-        print("轉換完成，暫存 wav：", tmp_wav)
+        args.output.write_text(text, encoding="utf-8")
+        print(f"轉錄完成，已寫入：{args.output}")
+        return 0
+    except (FileNotFoundError, ValueError, OSError, RuntimeError,
+            subprocess.CalledProcessError) as exc:
+        print(f"錯誤：{exc}", file=sys.stderr)
+        return 1
 
-        text, meta = transcribe_with_whisper(tmp_wav, model_name=model_name, language=language)
-
-        # 將結果寫入 output txt
-        with open(output_path, "w", encoding="utf-8") as f:
-            f.write(text)
-
-        print(f"轉錄完成，已寫入：{output_path}")
-    except Exception as e:
-        print("處理過程發生錯誤：", e)
-        raise
-    finally:
-        # 可選擇刪除暫存 wav（若需要保留可註解掉）
-        if os.path.exists(tmp_wav):
-            try:
-                os.remove(tmp_wav)
-            except Exception:
-                pass
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
